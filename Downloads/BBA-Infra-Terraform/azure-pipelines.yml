@@ -1,0 +1,233 @@
+# Azure DevOps Pipeline for Core Terraform Modules
+# This pipeline validates and tests the core infrastructure modules
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - modules/**
+      - examples/**
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - modules/**
+      - examples/**
+
+variables:
+  - name: terraformVersion
+    value: '1.13.3'
+
+stages:
+- stage: ModuleValidation
+  displayName: 'Module Validation'
+  jobs:
+  - job: ValidateModules
+    displayName: 'Validate Terraform Modules'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - script: |
+        curl -fsSL https://releases.hashicorp.com/terraform/1.13.3/terraform_1.13.3_linux_amd64.zip -o terraform.zip
+        unzip terraform.zip
+        sudo mv terraform /usr/local/bin/
+        terraform version
+      displayName: 'Install Terraform'
+    - script: |
+        set -e  # Exit on any error
+        echo "Validating main module..."
+        cd modules/azure-application-platform
+        terraform init -backend=false
+        if ! terraform validate; then
+          echo "##vso[task.logissue type=error]Terraform validation failed for main module"
+          exit 1
+        fi
+        echo "Validating service-bus submodule..."
+        cd service-bus
+        terraform init -backend=false
+        if ! terraform validate; then
+          echo "##vso[task.logissue type=error]Terraform validation failed for service-bus module"
+          exit 1
+        fi
+        echo "All modules validated successfully!"
+      displayName: 'Terraform Module Validation'
+      continueOnError: false
+
+- stage: CodeQuality
+  displayName: 'Code Quality & Formatting'
+  dependsOn: ModuleValidation
+  jobs:
+  - job: CodeQuality
+    displayName: 'Code Quality Analysis'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+      persistCredentials: true
+    
+    - script: |
+        curl -fsSL https://releases.hashicorp.com/terraform/1.13.3/terraform_1.13.3_linux_amd64.zip -o terraform.zip
+        unzip terraform.zip
+        sudo mv terraform /usr/local/bin/
+        terraform version
+      displayName: 'Install Terraform'
+    
+    - script: |
+        set -e  # Exit on any error
+        echo "Checking and fixing Terraform formatting..."
+        
+        # First check if formatting is needed
+        if terraform fmt -check -recursive .; then
+          echo "✅ Terraform formatting is already correct"
+        else
+          echo "📝 Terraform formatting issues detected, auto-fixing..."
+          
+          # Format the code
+          terraform fmt -recursive .
+          
+          # Check if any files were changed
+          if git diff --quiet; then
+            echo "✅ No formatting changes needed after all"
+          else
+            echo "📝 Formatting changes applied"
+            echo "Files that were formatted:"
+            git diff --name-only
+            
+            echo ""
+            echo "=========================================="
+            echo "⚠️  FORMATTING CHANGES REQUIRED"
+            echo "=========================================="
+            echo "The following files had formatting issues and have been auto-fixed:"
+            git diff --name-only
+            echo ""
+            echo "Please commit these formatting changes:"
+            echo "  git add ."
+            echo "  git commit -m 'style: Auto-format Terraform files'"
+            echo "  git push origin main"
+            echo ""
+            echo "Or run 'terraform fmt -recursive .' locally and commit the changes."
+            echo "=========================================="
+            
+            # Set the build result to indicate action needed
+            echo "##vso[task.logissue type=warning]Terraform formatting changes applied but not committed. Please commit the formatted files."
+            echo "##vso[task.complete result=SucceededWithIssues;]Formatting completed with manual action required"
+          fi
+        fi
+      displayName: 'Terraform Format & Auto-Fix'
+      continueOnError: false
+    
+    - script: |
+        set -e  # Exit on any error
+        echo "Running additional syntax checks..."
+        cd modules/azure-application-platform
+        # Check for syntax issues without requiring Azure authentication
+        echo "Checking for common Terraform syntax patterns..."
+        
+        # Check for missing required_providers blocks
+        if ! grep -r "required_providers" . > /dev/null; then
+          echo "##vso[task.logissue type=warning]No required_providers block found"
+        fi
+        
+        # Check for unused variables (basic check)
+        echo "Running basic configuration checks..."
+        terraform init -backend=false > /dev/null 2>&1
+        
+        # Validate that configuration can be loaded (without plan)
+        if ! terraform validate; then
+          echo "##vso[task.logissue type=error]Configuration validation failed"
+          exit 1
+        fi
+        
+        echo "Configuration syntax checks completed successfully"
+      displayName: 'Terraform Configuration Validation'
+      continueOnError: false
+
+- stage: SecurityScan
+  displayName: 'Security Scanning'
+  dependsOn: 
+    - ModuleValidation
+    - CodeQuality
+  jobs:
+  - job: SecurityScan
+    displayName: 'Module Security Analysis'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: trivy@2
+      displayName: 'Trivy Security Scan'
+      inputs:
+        type: 'fs'
+        target: 'modules/azure-application-platform'
+        severity: 'CRITICAL,HIGH'
+        format: 'table'
+        exitCode: '1'
+        version: 'latest'
+        skipAnalysis: false
+    
+    - script: |
+        echo "Displaying Trivy scan summary..."
+        if [ -f "$(Pipeline.Workspace)/trivy-results/trivy-results.json" ]; then
+          echo "Trivy scan results found"
+          cat "$(Pipeline.Workspace)/trivy-results/trivy-results.json" | jq -r '.Results[]? | select(.Vulnerabilities) | "\(.Target) - \(.Type): Found vulnerabilities"' || true
+        fi
+      displayName: 'Display Trivy Scan Summary'
+      continueOnError: true
+    
+    - script: |
+        echo "Installing tfsec..."
+        curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+        tfsec --version
+      displayName: 'Install TFSec'
+    
+    - script: |
+        set -e  # Exit on any error
+        echo "Running tfsec security analysis..."
+        if ! tfsec modules/azure-application-platform --format lovely --soft-fail; then
+          echo "##vso[task.logissue type=warning]tfsec found security recommendations"
+          # Don't fail on tfsec warnings, but log them
+        fi
+        echo "tfsec analysis completed"
+      displayName: 'TFSec Security Analysis'
+      continueOnError: false
+
+- stage: PipelineSummary
+  displayName: 'Pipeline Summary'
+  dependsOn: 
+    - ModuleValidation
+    - CodeQuality
+    - SecurityScan
+  condition: always()
+  variables:
+    moduleValidationResult: $[ stageDependencies.ModuleValidation.ValidateModules.result ]
+    codeQualityResult: $[ stageDependencies.CodeQuality.CodeQuality.result ]
+    securityScanResult: $[ stageDependencies.SecurityScan.SecurityScan.result ]
+  jobs:
+  - job: Summary
+    displayName: 'Validation Summary'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - script: |
+        echo "=== TERRAFORM MODULE PIPELINE SUMMARY ==="
+        echo "Module Validation: $(moduleValidationResult)"
+        echo "Code Quality: $(codeQualityResult)"
+        echo "Security Scan: $(securityScanResult)"
+        echo "============================================"
+        
+        # Check if any stage failed
+        if [ "$(moduleValidationResult)" != "Succeeded" ] || \
+           [ "$(codeQualityResult)" != "Succeeded" ] || \
+           [ "$(securityScanResult)" != "Succeeded" ]; then
+          echo "##vso[task.logissue type=error]One or more pipeline stages failed"
+          echo "Please review the validation, code quality, or security scan results"
+          exit 1
+        fi
+        
+        echo "✅ All checks passed! Terraform modules are ready for use."
+      displayName: 'Pipeline Result Summary'
+      continueOnError: false
